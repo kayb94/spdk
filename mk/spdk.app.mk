@@ -50,7 +50,7 @@ SPDK_FILTER_LIB_LIST += $(filter scsi,$(SPDK_LIB_LIST))
 
 # The unit test mock wrappers need to be wrapped in whole-archive so they don't get
 # automatically removed with LTO.
-SPDK_FILTER_LIB_LIST += $(filter spdk_mock,$(SPDK_LIB_LIST))
+SPDK_FILTER_LIB_LIST += $(filter ut_mock,$(SPDK_LIB_LIST))
 
 SPDK_WHOLE_ARCHIVE_LIB_LIST = $(SPDK_FILTER_LIB_LIST)
 SPDK_REMAINING_LIB_LIST = $(filter-out $(SPDK_WHOLE_ARCHIVE_LIB_LIST),$(SPDK_LIB_LIST))

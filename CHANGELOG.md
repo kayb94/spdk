@@ -17,7 +17,27 @@ prior to calling `spdk_nvmf_tgt_listen`.
 
 Related to the previous change, the rpc `set_nvmf_target_options` has been renamed to
 `set_nvmf_target_max_subsystems` to indicate that this is the only target option available for the user to edit.
-Usage of this rpc is still confined to the time prior to application subsystem initialization.
+
+### nvme
+
+Add a new TCP/IP transport(located in lib/nvme/nvme_tcp.c) in nvme driver. With
+this new transport, it can be used to connect the NVMe-oF target with the
+same TCP/IP support.
+
+### nvmf
+
+Add a new TCP/IP transport (located in lib/nvmf/tcp.c). With this tranport,
+the SPDK NVMe-oF target can have a new transport, and can serve the NVMe-oF
+protocol via TCP/IP from the host.
+
+### bdev
+
+On shutdown, bdev unregister now proceeds in top-down fashion, with
+claimed bdevs skipped (these will be unregistered later, when virtual
+bdev built on top of the respective base bdev unclaims it). This
+allows virtual bdevs to be shut down cleanly as opposed to the
+previous behavior that didn't differentiate between hotremove and
+planned shutdown.
 
 ## v18.10:
 

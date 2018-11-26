@@ -163,6 +163,8 @@ def get_aio_bdev_json(config, section):
     for option in config.options("AIO"):
         if option == "AIO":
             value = config.get("AIO", option).split("\n")
+    if value is None:
+        return aio_json
     for item in value:
         items = re.findall("\S+", item)
         params = {}
@@ -684,6 +686,9 @@ if __name__ == "__main__":
                     section_to_subsystem[match_section][
                         item['method']].append(item)
         elif section == "Global":
+            pass
+        elif section == "Ioat":
+            # Ioat doesn't support JSON config yet.
             pass
         elif section == "VirtioPci":
             print("Please use spdk target flags.")

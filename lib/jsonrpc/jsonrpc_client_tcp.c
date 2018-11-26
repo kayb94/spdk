@@ -36,151 +36,15 @@
 
 #define RPC_DEFAULT_PORT	"5260"
 
-static struct spdk_jsonrpc_client *
-_spdk_jsonrpc_client_connect(int domain, int protocol,
-			     struct sockaddr *server_addr, socklen_t addrlen)
-{
-	struct spdk_jsonrpc_client *client;
-	int rc;
-
-	client = calloc(1, sizeof(struct spdk_jsonrpc_client));
-	if (client == NULL) {
-		return NULL;
-	}
-
-	client->sockfd = socket(domain, SOCK_STREAM, protocol);
-	if (client->sockfd < 0) {
-		SPDK_ERRLOG("socket() failed\n");
-		free(client);
-		return NULL;
-	}
-
-	rc = connect(client->sockfd, server_addr, addrlen);
-	if (rc != 0) {
-		SPDK_ERRLOG("could not connet JSON-RPC server: %s\n", spdk_strerror(errno));
-		close(client->sockfd);
-		free(client);
-		return NULL;
-	}
-
-	return client;
-}
-
-struct spdk_jsonrpc_client *
-spdk_jsonrpc_client_connect(const char *rpc_sock_addr, int addr_family)
-{
-	struct spdk_jsonrpc_client *client;
-
-	if (addr_family == AF_UNIX) {
-		/* Unix Domain Socket */
-		struct sockaddr_un rpc_sock_addr_unix = {};
-		int rc;
-
-		rpc_sock_addr_unix.sun_family = AF_UNIX;
-		rc = snprintf(rpc_sock_addr_unix.sun_path,
-			      sizeof(rpc_sock_addr_unix.sun_path),
-			      "%s", rpc_sock_addr);
-		if (rc < 0 || (size_t)rc >= sizeof(rpc_sock_addr_unix.sun_path)) {
-			SPDK_ERRLOG("RPC Listen address Unix socket path too long\n");
-			return NULL;
-		}
-
-		client = _spdk_jsonrpc_client_connect(AF_UNIX, 0,
-						      (struct sockaddr *)&rpc_sock_addr_unix,
-						      sizeof(rpc_sock_addr_unix));
-	} else {
-		/* TCP/IP socket */
-		struct addrinfo		hints;
-		struct addrinfo		*res;
-		char *tmp;
-		char *host, *port;
-
-		tmp = strdup(rpc_sock_addr);
-		if (!tmp) {
-			SPDK_ERRLOG("Out of memory\n");
-			return NULL;
-		}
-
-		if (spdk_parse_ip_addr(tmp, &host, &port) < 0) {
-			free(tmp);
-			SPDK_ERRLOG("Invalid listen address '%s'\n", rpc_sock_addr);
-			return NULL;
-		}
-
-		if (port == NULL) {
-			port = RPC_DEFAULT_PORT;
-		}
-
-		memset(&hints, 0, sizeof(hints));
-		hints.ai_family = AF_UNSPEC;
-		hints.ai_socktype = SOCK_STREAM;
-		hints.ai_protocol = IPPROTO_TCP;
-
-		if (getaddrinfo(host, port, &hints, &res) != 0) {
-			free(tmp);
-			SPDK_ERRLOG("Unable to look up RPC connnect address '%s'\n", rpc_sock_addr);
-			return NULL;
-		}
-
-		client = _spdk_jsonrpc_client_connect(res->ai_family, res->ai_protocol,
-						      res->ai_addr, res->ai_addrlen);
-
-		freeaddrinfo(res);
-		free(tmp);
-	}
-
-	return client;
-}
-
-void
-spdk_jsonrpc_client_close(struct spdk_jsonrpc_client *client)
-{
-	if (client->sockfd >= 0) {
-		close(client->sockfd);
-	}
-
-	free(client->recv_buf);
-	if (client->resp) {
-		spdk_jsonrpc_client_free_response(&client->resp->jsonrpc);
-	}
-
-	free(client);
-}
-
-struct spdk_jsonrpc_client_request *
-spdk_jsonrpc_client_create_request(void)
-{
-	struct spdk_jsonrpc_client_request *request;
-
-	request = calloc(1, sizeof(*request));
-	if (request == NULL) {
-		return NULL;
-	}
-
-	/* memory malloc for send-buf */
-	request->send_buf = malloc(SPDK_JSONRPC_SEND_BUF_SIZE_INIT);
-	if (!request->send_buf) {
-		SPDK_ERRLOG("memory malloc for send-buf failed\n");
-		free(request);
-		return NULL;
-	}
-	request->send_buf_size = SPDK_JSONRPC_SEND_BUF_SIZE_INIT;
-
-	return request;
-}
-
-void
-spdk_jsonrpc_client_free_request(struct spdk_jsonrpc_client_request *req)
-{
-	free(req->send_buf);
-	free(req);
-}
-
-int
-spdk_jsonrpc_client_send_request(struct spdk_jsonrpc_client *client,
-				 struct spdk_jsonrpc_client_request *request)
+static int
+_spdk_jsonrpc_client_send_request(struct spdk_jsonrpc_client *client)
 {
 	ssize_t rc;
+	struct spdk_jsonrpc_client_request *request = client->request;
+
+	if (!request) {
+		return 0;
+	}
 
 	/* Reset offset in request */
 	request->send_offset = 0;
@@ -200,6 +64,9 @@ spdk_jsonrpc_client_send_request(struct spdk_jsonrpc_client *client,
 		request->send_len -= rc;
 	}
 
+	client->request = NULL;
+
+	spdk_jsonrpc_client_free_request(request);
 	return 0;
 }
 
@@ -225,11 +92,13 @@ recv_buf_expand(struct spdk_jsonrpc_client *client)
 	return 0;
 }
 
-int
-spdk_jsonrpc_client_recv_response(struct spdk_jsonrpc_client *client)
+static int
+_spdk_jsonrpc_client_poll(struct spdk_jsonrpc_client *client)
 {
 	ssize_t rc = 0;
 	size_t recv_avail;
+
+	_spdk_jsonrpc_client_send_request(client);
 
 	if (client->recv_buf == NULL) {
 		/* memory malloc for recv-buf */
@@ -284,12 +153,175 @@ spdk_jsonrpc_client_recv_response(struct spdk_jsonrpc_client *client)
 	return 0;
 }
 
+static int
+_spdk_jsonrpc_client_connect(struct spdk_jsonrpc_client *client, int domain, int protocol,
+			     struct sockaddr *server_addr, socklen_t addrlen)
+{
+	int rc;
+
+	client->sockfd = socket(domain, SOCK_STREAM, protocol);
+	if (client->sockfd < 0) {
+		rc = errno;
+		SPDK_ERRLOG("socket() failed\n");
+		return -rc;
+	}
+
+	rc = connect(client->sockfd, server_addr, addrlen);
+	if (rc != 0) {
+		SPDK_ERRLOG("could not connect to JSON-RPC server: %s\n", spdk_strerror(errno));
+		goto err;
+	}
+
+	return 0;
+err:
+	close(client->sockfd);
+	client->sockfd = -1;
+	return -rc;
+}
+
+struct spdk_jsonrpc_client *
+spdk_jsonrpc_client_connect(const char *addr, int addr_family)
+{
+	struct spdk_jsonrpc_client *client = calloc(1, sizeof(struct spdk_jsonrpc_client));
+	/* Unix Domain Socket */
+	struct sockaddr_un addr_un = {};
+	char *add_in = NULL;
+	int rc;
+
+	if (client == NULL) {
+		SPDK_ERRLOG("%s\n", spdk_strerror(errno));
+		return NULL;
+	}
+
+	if (addr_family == AF_UNIX) {
+		addr_un.sun_family = AF_UNIX;
+		rc = snprintf(addr_un.sun_path, sizeof(addr_un.sun_path), "%s", addr);
+		if (rc < 0 || (size_t)rc >= sizeof(addr_un.sun_path)) {
+			rc = -EINVAL;
+			SPDK_ERRLOG("RPC Listen address Unix socket path too long\n");
+			goto err;
+		}
+
+		rc = _spdk_jsonrpc_client_connect(client, AF_UNIX, 0, (struct sockaddr *)&addr_un, sizeof(addr_un));
+	} else {
+		/* TCP/IP socket */
+		struct addrinfo		hints;
+		struct addrinfo		*res;
+		char *host, *port;
+
+		add_in = strdup(addr);
+		if (!add_in) {
+			rc = -errno;
+			SPDK_ERRLOG("%s\n", spdk_strerror(errno));
+			goto err;
+		}
+
+		rc = spdk_parse_ip_addr(add_in, &host, &port);
+		if (rc) {
+			SPDK_ERRLOG("Invalid listen address '%s'\n", addr);
+			goto err;
+		}
+
+		if (port == NULL) {
+			port = RPC_DEFAULT_PORT;
+		}
+
+		memset(&hints, 0, sizeof(hints));
+		hints.ai_family = AF_UNSPEC;
+		hints.ai_socktype = SOCK_STREAM;
+		hints.ai_protocol = IPPROTO_TCP;
+
+		rc = getaddrinfo(host, port, &hints, &res);
+		if (rc != 0) {
+			SPDK_ERRLOG("Unable to look up RPC connnect address '%s' (%d): %s\n", addr, rc, gai_strerror(rc));
+			rc = -EINVAL;
+			goto err;
+		}
+
+		rc = _spdk_jsonrpc_client_connect(client, res->ai_family, res->ai_protocol, res->ai_addr,
+						  res->ai_addrlen);
+		freeaddrinfo(res);
+	}
+
+err:
+	if (rc != 0) {
+		free(client);
+		client = NULL;
+		errno = -rc;
+	}
+
+	free(add_in);
+	return client;
+}
+
+void
+spdk_jsonrpc_client_close(struct spdk_jsonrpc_client *client)
+{
+	if (client->sockfd >= 0) {
+		close(client->sockfd);
+	}
+
+	free(client->recv_buf);
+	if (client->resp) {
+		spdk_jsonrpc_client_free_response(&client->resp->jsonrpc);
+	}
+
+	free(client);
+}
+
+struct spdk_jsonrpc_client_request *
+spdk_jsonrpc_client_create_request(void)
+{
+	struct spdk_jsonrpc_client_request *request;
+
+	request = calloc(1, sizeof(*request));
+	if (request == NULL) {
+		return NULL;
+	}
+
+	/* memory malloc for send-buf */
+	request->send_buf = malloc(SPDK_JSONRPC_SEND_BUF_SIZE_INIT);
+	if (!request->send_buf) {
+		SPDK_ERRLOG("memory malloc for send-buf failed\n");
+		free(request);
+		return NULL;
+	}
+	request->send_buf_size = SPDK_JSONRPC_SEND_BUF_SIZE_INIT;
+
+	return request;
+}
+
+void
+spdk_jsonrpc_client_free_request(struct spdk_jsonrpc_client_request *req)
+{
+	free(req->send_buf);
+	free(req);
+}
+
+int
+spdk_jsonrpc_client_recv_response(struct spdk_jsonrpc_client *client)
+{
+	return _spdk_jsonrpc_client_poll(client);
+}
+
+int spdk_jsonrpc_client_send_request(struct spdk_jsonrpc_client *client,
+				     struct spdk_jsonrpc_client_request *req)
+{
+	if (client->request != NULL) {
+		return -ENOSPC;
+	}
+
+	client->request = req;
+	return 0;
+}
+
 struct spdk_jsonrpc_client_response *
 spdk_jsonrpc_client_get_response(struct spdk_jsonrpc_client *client)
 {
-	struct spdk_jsonrpc_client_response_internal *r = client->resp;
+	struct spdk_jsonrpc_client_response_internal *r;
 
-	if (r == NULL) {
+	r = client->resp;
+	if (r == NULL || r->ready == false) {
 		return NULL;
 	}
 
